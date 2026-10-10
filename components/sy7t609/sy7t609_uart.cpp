@@ -1,126 +1,181 @@
 #include "sy7t609_uart.h"
-#include "esphome/core/log.h"
+
 #include <cmath>
+
+#include "esphome/core/hal.h"
+#include "esphome/core/log.h"
 
 namespace esphome {
 namespace sy7t609 {
 
 static const char *const TAG = "sy7t609";
 
-// ============================================================================
-// 测量值解析函数
-// ============================================================================
-float SY7T609_UART::parse_milli_(uint32_t raw) {
-  return raw / 1000.0f;
-}
+float SY7T609_UART::parse_milli_(uint32_t raw) { return static_cast<float>(raw) / 1000.0f; }
 
-// 24bit 二进制补码：>= 0x800000 视为负数。
-// 注意：此处沿用原实现的语义——返回幅值（绝对值），保持测量输出兼容。
-float SY7T609_UART::parse_abs_milli_(uint32_t raw) {
-  uint32_t v = (raw >= 0x800000) ? (0x01000000u - raw) : raw;
-  return static_cast<float>(v) / 1000.0f;
-}
-
-// 24bit 二进制补码：保留正负号。
-// 正值=正向（用电/吸收），负值=反向（回馈电网/光伏倒送、容性无功）。
 float SY7T609_UART::parse_signed_milli_(uint32_t raw) {
-  int32_t v = (raw >= 0x800000) ? (static_cast<int32_t>(raw) - 0x01000000) : static_cast<int32_t>(raw);
-  return static_cast<float>(v) / 1000.0f;
+  raw &= 0x00FFFFFFu;
+  const int32_t value = (raw & 0x00800000u) != 0 ? static_cast<int32_t>(raw | 0xFF000000u)
+                                                   : static_cast<int32_t>(raw);
+  return static_cast<float>(value) / 1000.0f;
 }
 
 float SY7T609_UART::parse_raw_(uint32_t raw) {
+  // 数据手册：EPPCNT 每增加 1，表示累计一个 BUCKET。当前固定 BUCKET 校准值对应 1 Wh。
   return static_cast<float>(raw);
 }
 
-// ============================================================================
-// 测量值注册表（表驱动核心）
-// 想新增一种读取数据：在此表加一行 + 在 .h 增加成员/ setter + 在 sensor.py 注册即可。
-// ============================================================================
-const std::array<SY7T609_UART::Measurement, 7> &SY7T609_UART::get_measurements_() {
-  static const std::array<Measurement, 7> table = {{
-      {ADDR_PF,     &SY7T609_UART::power_factor_sensor_,   &SY7T609_UART::parse_signed_milli_},
-      {ADDR_VRMS,   &SY7T609_UART::voltage_sensor_,        &SY7T609_UART::parse_milli_},
-      {ADDR_IRMS,   &SY7T609_UART::current_sensor_,        &SY7T609_UART::parse_milli_},
-      {ADDR_POWER,  &SY7T609_UART::power_sensor_,          &SY7T609_UART::parse_signed_milli_},
-      {ADDR_VAR,    &SY7T609_UART::power_reactive_sensor_, &SY7T609_UART::parse_signed_milli_},
-      {ADDR_EPPCNT, &SY7T609_UART::energy_sensor_,         &SY7T609_UART::parse_raw_},
-      {ADDR_CTEMP,  &SY7T609_UART::temperature_sensor_,    &SY7T609_UART::parse_milli_},
+uint32_t SY7T609_UART::extract_data_(const std::vector<uint8_t> &frame) {
+  return (static_cast<uint32_t>(frame[4]) << 16) | (static_cast<uint32_t>(frame[3]) << 8) |
+         static_cast<uint32_t>(frame[2]);
+}
+
+float SY7T609_UART::apply_deadband_(uint16_t addr, float value) const {
+  // 仅对功率类读数施加死区：绝对值低于阈值时视为空载噪声并归零，
+  // 高于阈值的读数原样返回（含负号），因此真正的反向功率不受影响。
+  float threshold = 0.0f;
+  switch (addr) {
+    case ADDR_POWER:
+      threshold = power_deadband_;
+      break;
+    case ADDR_VAR:
+      threshold = reactive_power_deadband_;
+      break;
+    case ADDR_PF:
+      threshold = power_factor_deadband_;
+      break;
+    default:
+      return value;
+  }
+  return (std::fabs(value) < threshold) ? 0.0f : value;
+}
+
+const std::array<SY7T609_UART::Measurement, 10> &SY7T609_UART::get_measurements_() {
+  static const std::array<Measurement, 10> table = {{
+      {ADDR_PF, &SY7T609_UART::power_factor_sensor_, &SY7T609_UART::parse_signed_milli_},
+      {ADDR_VRMS, &SY7T609_UART::voltage_sensor_, &SY7T609_UART::parse_milli_},
+      {ADDR_IRMS, &SY7T609_UART::current_sensor_, &SY7T609_UART::parse_milli_},
+      {ADDR_POWER, &SY7T609_UART::power_sensor_, &SY7T609_UART::parse_signed_milli_},
+      {ADDR_VAR, &SY7T609_UART::power_reactive_sensor_, &SY7T609_UART::parse_signed_milli_},
+      {ADDR_VA, &SY7T609_UART::apparent_power_sensor_, &SY7T609_UART::parse_signed_milli_},
+      {ADDR_FREQUENCY, &SY7T609_UART::frequency_sensor_, &SY7T609_UART::parse_milli_},
+      {ADDR_EPPCNT, &SY7T609_UART::energy_sensor_, &SY7T609_UART::parse_raw_},
+      {ADDR_EPMCNT, &SY7T609_UART::reverse_energy_sensor_, &SY7T609_UART::parse_raw_},
+      {ADDR_CTEMP, &SY7T609_UART::temperature_sensor_, &SY7T609_UART::parse_signed_milli_},
   }};
   return table;
 }
 
-// ============================================================================
-// 生命周期
-// ============================================================================
 void SY7T609_UART::setup() {
   this->flush();
-  // 上电软复位，芯片会从自身 flash 载入已保存的校准值。
-  uartSendWriteCmd(ADDR_COMMAND, CMD_REG_SOFT_RESET);
+  rx_buffer_.reserve(MAX_RX_BUFFER_SIZE);
+  // 按用户要求保留：每次启动均软复位计量芯片。
+  if (!send_write_and_wait_ack_(ADDR_COMMAND, CMD_REG_SOFT_RESET, 250)) {
+    ESP_LOGW(TAG, "Soft reset was sent but no valid ACK was received");
+  }
 }
 
 void SY7T609_UART::loop() {
-  handleActionCallback();
+  collect_uart_();
 
-  const uint32_t now = millis();
-
-  // 超时恢复：超过 500ms 没有完整帧，则清空缓冲并复位读取状态。
-  // （软复位后偶尔收不到回复，会卡住状态机，这里作为兜底补丁。）
-  if (now - this->last_read_ > 500 && this->available() != SSI_UART_READ_RECV_PKG_SIZE) {
-    while (this->available()) {
-      this->read();
-      yield();
+  std::vector<uint8_t> frame;
+  while (extract_frame_(frame)) {
+    if (m_state == ProcessState::READING) {
+      handle_read_frame_(frame);
+    } else {
+      ESP_LOGV(TAG, "Ignoring unsolicited reply 0x%02X", frame[0]);
     }
-    this->last_read_ = now;
-    if (m_state != ProcessState::IDLE) {
-      m_state = ProcessState::IDLE;
-      read_index_ = 0;
-    }
+    frame.clear();
   }
 
-  // 收到完整回复帧且正处于读取等待中：解析并发布，然后推进到下一项。
-  if (now - this->last_read_ > 20 && this->available() == SSI_UART_READ_RECV_PKG_SIZE &&
-      m_state == ProcessState::READING) {
-    auto resp = *this->read_array<SSI_UART_READ_RECV_PKG_SIZE>();
-    bool ok = true;
-
-    if (resp[0] != REPLY_ACK_WITH_DATA) {
-      ESP_LOGE(TAG, "SY7T609 read_index[%u], invalid REPLY_ACK_WITH_DATA! 0x%02X",
-               static_cast<unsigned>(read_index_), resp[0]);
-      ok = false;
-    }
-    uint8_t sum = checksum<SSI_UART_READ_RECV_PKG_SIZE>(resp);
-    if (sum != resp[resp.max_size() - 1]) {
-      ESP_LOGW(TAG, "SY7T609 read_index[%u], invalid checksum! 0x%02X != 0x%02X",
-               static_cast<unsigned>(read_index_), sum, resp[resp.max_size() - 1]);
-      ok = false;
-    }
-
-    const auto &table = get_measurements_();
-    const Measurement &m = table[read_index_];
-    sensor::Sensor *target = this->*(m.sensor_ptr);
-    if (ok && target != nullptr) {
-      target->publish_state(m.parse(extractData(resp)));
-    }
-
-    advance_read_();
-    this->last_read_ = now;
+  if (m_state == ProcessState::READING && millis() - last_read_ >= READ_TIMEOUT_MS) {
+    retry_or_advance_("timeout");
   }
+
+  if (m_state == ProcessState::IDLE) handleActionCallback();
 }
 
 void SY7T609_UART::update() {
-  if (m_state == ProcessState::IDLE && !isNeedHandleActionCallback()) {
-    if (seek_next_active_(0)) {
-      start_current_read_();
-    }
-  } else {
-    ESP_LOGD(TAG, "SY7T609 skip update, state[%d], callbackQueue[%u].",
-             static_cast<int>(m_state), static_cast<unsigned>(m_vecActionCallback.size()));
+  if (m_state == ProcessState::IDLE && !isNeedHandleActionCallback() && seek_next_active_(0)) {
+    retry_count_ = 0;
+    start_current_read_();
+  } else if (m_state != ProcessState::IDLE) {
+    ESP_LOGD(TAG, "Skipping update while a read cycle is active");
   }
 }
 
-// ============================================================================
-// 读取流程（表驱动）
-// ============================================================================
+void SY7T609_UART::collect_uart_() {
+  while (this->available()) {
+    const int value = this->read();
+    if (value < 0) break;
+    if (rx_buffer_.size() >= MAX_RX_BUFFER_SIZE) {
+      ESP_LOGW(TAG, "RX buffer overflow; discarding oldest byte");
+      rx_buffer_.erase(rx_buffer_.begin());
+    }
+    rx_buffer_.push_back(static_cast<uint8_t>(value));
+  }
+}
+
+bool SY7T609_UART::is_reply_code_(uint8_t code) {
+  switch (code) {
+    case REPLY_ACK_WITH_DATA:
+    case REPLY_AUTO_REPORTING_HEADER:
+    case REPLY_ACK_WITHOUT_DATA:
+    case REPLY_NEGATIVE_ACK:
+    case REPLY_COMMAND_NOT_IMPLEMENTED:
+    case REPLY_CHECKSUM_FAILED:
+    case REPLY_BUFFER_OVERFLOW:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool SY7T609_UART::frame_checksum_valid_(const std::vector<uint8_t> &frame) {
+  uint8_t sum = 0;
+  for (uint8_t byte : frame) sum = static_cast<uint8_t>(sum + byte);
+  return sum == 0;
+}
+
+bool SY7T609_UART::extract_frame_(std::vector<uint8_t> &frame) {
+  while (!rx_buffer_.empty() && !is_reply_code_(rx_buffer_[0])) rx_buffer_.erase(rx_buffer_.begin());
+  if (rx_buffer_.size() < SSI_DEFAULT_FRAME_SIZE) return false;
+
+  const std::size_t frame_size = rx_buffer_[1];
+  if (frame_size < SSI_DEFAULT_FRAME_SIZE || frame_size > MAX_FRAME_SIZE) {
+    ESP_LOGW(TAG, "Invalid SSI frame length %u", static_cast<unsigned>(frame_size));
+    rx_buffer_.erase(rx_buffer_.begin());
+    return extract_frame_(frame);
+  }
+  if (rx_buffer_.size() < frame_size) return false;
+
+  frame.assign(rx_buffer_.begin(), rx_buffer_.begin() + frame_size);
+  rx_buffer_.erase(rx_buffer_.begin(), rx_buffer_.begin() + frame_size);
+  if (!frame_checksum_valid_(frame)) {
+    ESP_LOGW(TAG, "Discarding SSI frame with invalid checksum");
+    if (m_state == ProcessState::READING) retry_or_advance_("checksum error");
+    frame.clear();
+    return extract_frame_(frame);
+  }
+  return true;
+}
+
+void SY7T609_UART::handle_read_frame_(const std::vector<uint8_t> &frame) {
+  if (frame[0] != REPLY_ACK_WITH_DATA || frame.size() != SSI_UART_READ_RECV_PKG_SIZE) {
+    ESP_LOGW(TAG, "Read failed: reply=0x%02X length=%u", frame[0], static_cast<unsigned>(frame.size()));
+    retry_or_advance_("negative or malformed reply");
+    return;
+  }
+
+  const auto &measurement = get_measurements_()[read_index_];
+  sensor::Sensor *target = this->*(measurement.sensor_ptr);
+  if (target != nullptr) {
+    const float value = apply_deadband_(measurement.addr, measurement.parse(extract_data_(frame)));
+    target->publish_state(value);
+  }
+  retry_count_ = 0;
+  advance_read_();
+}
+
 bool SY7T609_UART::seek_next_active_(std::size_t from) {
   const auto &table = get_measurements_();
   for (std::size_t i = from; i < table.size(); i++) {
@@ -133,9 +188,11 @@ bool SY7T609_UART::seek_next_active_(std::size_t from) {
 }
 
 void SY7T609_UART::start_current_read_() {
-  const auto &table = get_measurements_();
-  uartSendReadCmd(table[read_index_].addr);
+  rx_buffer_.clear();
+  while (this->available()) this->read();
+  uartSendReadCmd(get_measurements_()[read_index_].addr);
   m_state = ProcessState::READING;
+  last_read_ = millis();
 }
 
 void SY7T609_UART::advance_read_() {
@@ -144,31 +201,40 @@ void SY7T609_UART::advance_read_() {
   } else {
     m_state = ProcessState::IDLE;
     read_index_ = 0;
+    retry_count_ = 0;
   }
 }
 
-// ============================================================================
-// SSI 读写
-// ============================================================================
+void SY7T609_UART::retry_or_advance_(const char *reason) {
+  if (retry_count_ < MAX_READ_RETRIES) {
+    retry_count_++;
+    ESP_LOGW(TAG, "Retrying register 0x%04X (%u/%u): %s", get_measurements_()[read_index_].addr,
+             retry_count_, MAX_READ_RETRIES, reason);
+    start_current_read_();
+    return;
+  }
+  ESP_LOGE(TAG, "Skipping register 0x%04X after retries: %s", get_measurements_()[read_index_].addr, reason);
+  retry_count_ = 0;
+  advance_read_();
+}
+
 void SY7T609_UART::uartSendReadCmd(uint16_t addr) {
   std::array<uint8_t, SSI_UART_READ_SEND_PKG_SIZE> data{};
   data[0] = SSI_HEADER;
-  data[1] = SSI_UART_READ_SEND_PKG_SIZE;
+  data[1] = data.size();
   data[2] = CMD_SELECT_REGISTER_ADDRESS;
   data[3] = addr & 0xFF;
   data[4] = (addr >> 8) & 0xFF;
   data[5] = CMD_READ_REGITSTER_3BYTES;
-  data[6] = checksum<SSI_UART_READ_SEND_PKG_SIZE>(data);
-
+  data[6] = checksum(data);
   this->write_array(data);
   this->flush();
-  delay(0);
 }
 
 void SY7T609_UART::uartSendWriteCmd(uint16_t addr, uint32_t value) {
   std::array<uint8_t, SSI_UART_WRITE_SEND_PKG_SIZE> data{};
   data[0] = SSI_HEADER;
-  data[1] = SSI_UART_WRITE_SEND_PKG_SIZE;
+  data[1] = data.size();
   data[2] = CMD_SELECT_REGISTER_ADDRESS;
   data[3] = addr & 0xFF;
   data[4] = (addr >> 8) & 0xFF;
@@ -176,116 +242,81 @@ void SY7T609_UART::uartSendWriteCmd(uint16_t addr, uint32_t value) {
   data[6] = value & 0xFF;
   data[7] = (value >> 8) & 0xFF;
   data[8] = (value >> 16) & 0xFF;
-  data[9] = checksum<SSI_UART_WRITE_SEND_PKG_SIZE>(data);
-
+  data[9] = checksum(data);
   this->write_array(data);
   this->flush();
-  delay(0);
 }
 
-// ============================================================================
-// 动作回调队列
-// ============================================================================
+bool SY7T609_UART::send_write_and_wait_ack_(uint16_t addr, uint32_t value, uint32_t timeout_ms) {
+  rx_buffer_.clear();
+  while (this->available()) this->read();
+  uartSendWriteCmd(addr, value);
+
+  const uint32_t started = millis();
+  while (millis() - started < timeout_ms) {
+    collect_uart_();
+    std::vector<uint8_t> frame;
+    if (extract_frame_(frame)) {
+      if (frame[0] == REPLY_ACK_WITHOUT_DATA && frame.size() == SSI_DEFAULT_FRAME_SIZE) return true;
+      ESP_LOGW(TAG, "Write rejected: reply=0x%02X", frame[0]);
+      return false;
+    }
+    delay(1);
+    yield();
+  }
+  ESP_LOGW(TAG, "Write ACK timeout for register 0x%04X", addr);
+  return false;
+}
+
 int SY7T609_UART::addActionCallBack(ActionCallbackFuncPtr ptrFunc) {
   m_vecActionCallback.push_back(ptrFunc);
-  return m_vecActionCallback.size();
+  return static_cast<int>(m_vecActionCallback.size());
 }
 
 void SY7T609_UART::handleActionCallback() {
-  if (m_vecActionCallback.empty()) {
-    return;
-  }
-  for (std::size_t i = 0; i < m_vecActionCallback.size(); i++) {
-    ActionCallbackFuncPtr ptrFunc = m_vecActionCallback[i];
-    if (ptrFunc) {
-      ESP_LOGI(TAG, "SY7T609 handleActionCallback[%u]...", static_cast<unsigned>(i));
-      (this->*ptrFunc)();
-    }
-  }
-
-  // 清空可能残留的回复数据，并复位读取状态。
-  while (this->available()) {
-    this->read();
-  }
+  if (m_vecActionCallback.empty()) return;
+  const auto callbacks = m_vecActionCallback;
   m_vecActionCallback.clear();
+  for (auto callback : callbacks) {
+    if (callback != nullptr) (this->*callback)();
+  }
   m_state = ProcessState::IDLE;
   read_index_ = 0;
+  retry_count_ = 0;
 }
 
-// ============================================================================
-// 动作实现
-// ============================================================================
 void SY7T609_UART::reset_energy_() {
-  ESP_LOGI(TAG, "SY7T609 reset energy...");
-  uartSendWriteCmd(ADDR_COMMAND, CMD_REG_CLEAR_ENGERGY_COUNTERS);
-  delay(20);
+  ESP_LOGI(TAG, "Clearing energy counters");
+  if (send_write_and_wait_ack_(ADDR_COMMAND, CMD_REG_CLEAR_ENGERGY_COUNTERS)) {
+    if (energy_sensor_ != nullptr) energy_sensor_->publish_state(0.0f);
+    ESP_LOGI(TAG, "Energy counters cleared");
+  } else {
+    ESP_LOGE(TAG, "Energy counter clear failed; state was not changed");
+  }
 }
 
 void SY7T609_UART::reset_calibration_() {
-  ESP_LOGI(TAG, "SY7T609 apply fixed calibration...");
-  uartSendWriteCmd(ADDR_IGAIN, DEFAULT_IGAIN);              delay(20);
-  uartSendWriteCmd(ADDR_VGAIN, DEFAULT_VGAIN);              delay(20);
-  uartSendWriteCmd(ADDR_ISCALE, DEFAULT_ISCALE);           delay(20);
-  uartSendWriteCmd(ADDR_VSCALE, DEFAULT_VSCALE);           delay(20);
-  uartSendWriteCmd(ADDR_PSCALE, DEFAULT_PSCALE);           delay(20);
-  uartSendWriteCmd(ADDR_ACCUM, DEFAULT_ACCUM);             delay(20);
-  uartSendWriteCmd(ADDR_IRMS_TARGET, DEFAULT_IRMS_TARGET); delay(20);
-  uartSendWriteCmd(ADDR_VRMS_TARGET, DEFAULT_VRMS_TARGET); delay(20);
-  uartSendWriteCmd(ADDR_POWER_TARGET, DEFAULT_POWER_TARGET); delay(20);
-  uartSendWriteCmd(ADDR_BUCKETL, DEFAULT_BUCKETL);         delay(20);
-  uartSendWriteCmd(ADDR_BUCKETH, DEFAULT_BUCKETH);         delay(20);
-  uartSendWriteCmd(ADDR_CONTROL, DEFAULT_CONTROL);         delay(20);
-  uartSendWriteCmd(ADDR_COMMAND, CMD_REG_SAVE_TO_FLASH);
-  delay(20);
-  ESP_LOGI(TAG, "SY7T609 calibration saved to flash.");
-}
+  struct RegisterValue { uint16_t addr; uint32_t value; };
+  static const RegisterValue values[] = {
+      {ADDR_IGAIN, DEFAULT_IGAIN}, {ADDR_VGAIN, DEFAULT_VGAIN}, {ADDR_ISCALE, DEFAULT_ISCALE},
+      {ADDR_VSCALE, DEFAULT_VSCALE}, {ADDR_PSCALE, DEFAULT_PSCALE}, {ADDR_ACCUM, DEFAULT_ACCUM},
+      {ADDR_IRMS_TARGET, DEFAULT_IRMS_TARGET}, {ADDR_VRMS_TARGET, DEFAULT_VRMS_TARGET},
+      {ADDR_POWER_TARGET, DEFAULT_POWER_TARGET}, {ADDR_BUCKETL, DEFAULT_BUCKETL},
+      {ADDR_BUCKETH, DEFAULT_BUCKETH}, {ADDR_CONTROL, DEFAULT_CONTROL},
+  };
 
-// 寄存器目标值 = 真实工程量 × 1000，并裁剪到 24bit。
-static uint32_t to_target_milli_(float real_value) {
-  long v = lroundf(real_value * 1000.0f);
-  if (v < 0) v = 0;
-  return static_cast<uint32_t>(v) & 0xFFFFFFu;
-}
-
-void SY7T609_UART::calibrate_voltage_() {
-  uint32_t target = to_target_milli_(pending_cal_voltage_);
-  ESP_LOGI(TAG, "SY7T609 calibrate VOLTAGE: real=%.3f V -> VRMS_TARGET=0x%06X",
-           pending_cal_voltage_, static_cast<unsigned>(target));
-  uartSendWriteCmd(ADDR_VRMS_TARGET, target);                  delay(20);
-  uartSendWriteCmd(ADDR_COMMAND, CMD_REG_CALIBRATION_VOLTAGE); delay(40);
-  uartSendWriteCmd(ADDR_COMMAND, CMD_REG_SAVE_TO_FLASH);       delay(40);
-  ESP_LOGI(TAG, "SY7T609 voltage calibration done & saved.");
-}
-
-void SY7T609_UART::calibrate_current_() {
-  uint32_t target = to_target_milli_(pending_cal_current_);
-  ESP_LOGI(TAG, "SY7T609 calibrate CURRENT: real=%.3f A -> IRMS_TARGET=0x%06X",
-           pending_cal_current_, static_cast<unsigned>(target));
-  uartSendWriteCmd(ADDR_IRMS_TARGET, target);                  delay(20);
-  uartSendWriteCmd(ADDR_COMMAND, CMD_REG_CALIBRATION_CURRENT); delay(40);
-  uartSendWriteCmd(ADDR_COMMAND, CMD_REG_SAVE_TO_FLASH);       delay(40);
-  ESP_LOGI(TAG, "SY7T609 current calibration done & saved.");
-}
-
-void SY7T609_UART::calibrate_generic_() {
-  ESP_LOGI(TAG, "SY7T609 calibrate GENERIC: reg=0x%04X val=0x%06X cmd=0x%06X",
-           static_cast<unsigned>(pending_cal_addr_),
-           static_cast<unsigned>(pending_cal_value_),
-           static_cast<unsigned>(pending_cal_command_));
-  if (pending_cal_addr_ != ADDR_ERROR) {
-    uartSendWriteCmd(pending_cal_addr_, pending_cal_value_);   delay(20);
+  ESP_LOGI(TAG, "Applying fixed calibration");
+  for (const auto &item : values) {
+    if (!send_write_and_wait_ack_(item.addr, item.value)) {
+      ESP_LOGE(TAG, "Calibration aborted at register 0x%04X", item.addr);
+      return;
+    }
   }
-  if (pending_cal_command_ != CMD_NONE) {
-    uartSendWriteCmd(ADDR_COMMAND, pending_cal_command_);      delay(40);
+  if (!send_write_and_wait_ack_(ADDR_COMMAND, CMD_REG_SAVE_TO_FLASH, 300)) {
+    ESP_LOGE(TAG, "Calibration applied but saving to flash failed");
+    return;
   }
-  uartSendWriteCmd(ADDR_COMMAND, CMD_REG_SAVE_TO_FLASH);       delay(40);
-  ESP_LOGI(TAG, "SY7T609 generic calibration done & saved.");
-}
-
-void SY7T609_UART::save_calibration_() {
-  ESP_LOGI(TAG, "SY7T609 save calibration to flash...");
-  uartSendWriteCmd(ADDR_COMMAND, CMD_REG_SAVE_TO_FLASH);
-  delay(20);
+  ESP_LOGI(TAG, "Calibration saved to flash");
 }
 
 }  // namespace sy7t609

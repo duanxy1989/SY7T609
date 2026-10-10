@@ -56,8 +56,11 @@ enum sy7t609_register_map {
     ADDR_IRMS          = 0x0036,
     ADDR_POWER         = 0x0039,
     ADDR_VAR           = 0x003C,
+    ADDR_VA            = 0x003F,  // Scaled Apparent Power（视在功率，S24，÷1000 得 VA）
+    ADDR_FREQUENCY     = 0x0042,  // Scaled Line Frequency（线路频率，U24，÷1000 得 Hz）
     ADDR_PF            = 0x0048,
-    ADDR_EPPCNT        = 0x0069,  // Positive Active Energy Count
+    ADDR_EPPCNT        = 0x0069,  // Positive Active Energy Count（正向有功电量，用电）
+    ADDR_EPMCNT        = 0x006C,  // Negative Active Energy Count（反向有功电量，倒送）
     // Calibration Address
     ADDR_BUCKETL       = 0x00C0,
     ADDR_BUCKETH       = 0x00C3,
@@ -82,11 +85,7 @@ enum command_register_code {
     CMD_NONE                       = 0x000000,
     CMD_REG_CLEAR_ENGERGY_COUNTERS = 0xEC0000,  // 清除所有电能计数器
     CMD_REG_SOFT_RESET             = 0xBD0000,  // 软复位
-    CMD_REG_SAVE_TO_FLASH          = 0xACC200,  // 保存当前寄存器到 flash
-    // ---- 自动校准命令（0xCA 前缀，低 16 位为校准目标位掩码）----
-    // 下面两个命令码来自设备原厂固件，已确认可用。
-    CMD_REG_CALIBRATION_VOLTAGE    = 0xCA0020,  // 电压增益自动校准（依据 VRMS_TARGET 计算 VGAIN）
-    CMD_REG_CALIBRATION_CURRENT    = 0xCA0010   // 电流增益自动校准（依据 IRMS_TARGET 计算 IGAIN）
+    CMD_REG_SAVE_TO_FLASH          = 0xACC200   // 保存当前寄存器到 flash
 };
 
 // ============================================================================
